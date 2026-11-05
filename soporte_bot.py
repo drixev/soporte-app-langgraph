@@ -8,6 +8,7 @@ from langchain_core.tools import tool
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode, tools_condition
+from langgraph.checkpoint.memory import InMemorySaver
 
 load_dotenv() # lee las apis keys y el modelo desde el archivo .env
 
@@ -113,14 +114,27 @@ builder.add_edge("tools", "pedidos")                        # el resultado vuelv
 builder.add_edge("devoluciones", END)
 builder.add_edge("responder", END)
 
+# memory per thread
+checkpointer = InMemorySaver();
+
 # build
-grafo = builder.compile()
+grafo = builder.compile(checkpointer=checkpointer)
 
 # Test
 if __name__ == "__main__":
+    config = {"configurable": { "thread_id" : "client_1" }}
+    
     print(grafo.get_graph().draw_mermaid()) # dibuja el grafo
-    salida = grafo.invoke({"messages": [("user", "¿Dónde está mi pedido 123?")]})
-    #print(salida["intencion"], "->", salida["messages"][-1].content)
+    
+    grafo.invoke({"messages": [("user", "¿Dónde está mi pedido 123?")]}, config)
+    salida = grafo.invoke({"messages": [("user", "¿Y cuanto pagué?")]}, config)
+    
+    print(salida["intencion"], "->", salida["messages"][-1].content)
+    
+    estado = grafo.get_state(config)
+    
+    print("Mensajes guardados en el hilo", len(estado.values["messages"]))
+    
     for m in salida["messages"]:
         m.pretty_print()
 
