@@ -42,18 +42,20 @@ LIMITE_SIN_APROBACION = 100 # devoluciones mayores requieren supervisor
 class CamposEstado(StrEnum):
     MENSAGES = "messages"
     INTENCION = "intencion"
-    PEDIDOS_IDS = "pedidos_ids"
+    PEDIDO_IDS = "pedido_ids"
+    PEDIDO = "pedido"
+    APROBADA = "aprobada"
 
 # memory
 class Estado(TypedDict):
     messages: Annotated[list, add_messages]
     intencion: str
-    pedidos_ids: list[str]
+    pedido_ids: list[str]
     
 # model
 class Clasificacion(BaseModel):
     intencion: Literal["pedidos","devoluciones","faq"] = Field(description="Qué necesita el cliente")
-    pedidos_ids: list[str] = Field(default_factory=list, description="Números de pedidos mencionados")
+    pedido_ids: list[str] = Field(default_factory=list, description="Números de pedidos mencionados")
     
 clasificador = llm.with_structured_output(Clasificacion)
 
@@ -89,7 +91,7 @@ def clasificar(estado: Estado):
         [("system","Clasifica el último mensaje del cliente"), *estado[CamposEstado.MENSAGES]]
     )
     
-    return {CamposEstado.INTENCION: resultado.intencion, CamposEstado.PEDIDOS_IDS: resultado.pedidos_ids}
+    return {CamposEstado.INTENCION: resultado.intencion, CamposEstado.PEDIDO_IDS: resultado.pedido_ids}
 
 def pedidos(estado: Estado):
     instrucciones = SYSTEM + " Ayudas con el estado de pedidos."
@@ -97,21 +99,53 @@ def pedidos(estado: Estado):
     # respuesta = llm.invoke([("system", instrucciones), *estado[CamposEstado.MENSAGES]])
     return {CamposEstado.MENSAGES:[respuesta]}
 
-def devoluciones(estado: Estado):
-    if not estado[CamposEstado.PEDIDOS_IDS] or estado[CamposEstado.PEDIDOS_IDS][0] not in PEDIDOS:
-        return { CamposEstado.MENSAGES: [AIMessage("¿Me confirmas el número de pedido a devolver?")] }
-
-    pedido_id = estado[CamposEstado.PEDIDOS_IDS][0]
-    total = PEDIDOS[pedido_id]["total"]
+# subgrafo devoluciones
+class EstadoDevolucion(TypedDict):
+    messages: Annotated[list, add_messages] # compartida con el grafo padre
+    pedido_ids: list[str]                   # compartida con el grafo padre
+    pedido: dict                            # privada del subgrafo
+    aprobada: bool                          # privada del subgrafo
     
-    if total > LIMITE_SIN_APROBACION:
-        # Pausa el grafo y espera la decision de un supervisor
-        decision = interrupt({"accion": "aprobar_devolucion", "pedido": pedido_id, "monto": total})
-        if decision !=  "aprobar":
-            return {CamposEstado.MENSAGES: [AIMessage(f"La devolución del pedido {pedido_id} no fue aprobada")]}
+# nodos del subgrafo
+def validar(estado: EstadoDevolucion):
+    ids = estado[CamposEstado.PEDIDO_IDS]
+    if not ids or ids[0] not in PEDIDOS:
+        return { CamposEstado.PEDIDO: [AIMessage("¿Me confirmas el número de pedido a devolver?")] }
+    return {CamposEstado.PEDIDO: { "id": ids[0], **PEDIDOS[ids[0]] }, CamposEstado.APROBADA: True}
+        
+def tras_validar(estado:EstadoDevolucion) -> Literal["aprobacion", "confirmar", "__end__"]:
+    if not estado[CamposEstado.PEDIDO]:
+        return END
+    if estado[CamposEstado.PEDIDO]["total"] > LIMITE_SIN_APROBACION:
+        return "aprobacion"
+    return "confirmar"
 
-    mensaje  = f"Devolución del pedido {pedido_id} registrada. Reembolso de ${total} en 3-5 dias"
+def aprobacion(estado:EstadoDevolucion):
+    p = estado[CamposEstado.PEDIDO]
+    decision = interrupt({"accion":"aprobar_devolucion", "pedido":p["id"], "monto":p["total"]})
+    return {CamposEstado.APROBADA: decision == "aprobar"}
+
+
+def confirmar(estado: EstadoDevolucion):
+    p = estado[CamposEstado.PEDIDO]
+    
+    if not estado[CamposEstado.APROBADA]:
+        return {CamposEstado.MENSAGES: [AIMessage(f"La devolución del pedido {p['id']} no fue aprobada.")]}
+    
+    mensaje  = f"Devolución del pedido {p['id']} registrada. Reembolso de ${p['total']:.2f} en 3-5 dias."
     return {CamposEstado.MENSAGES: [AIMessage(mensaje)]}
+
+sub = StateGraph(EstadoDevolucion)
+sub.add_node("validar", validar)
+sub.add_node("aprobacion", aprobacion)
+sub.add_node("confirmar",confirmar)
+
+sub.add_edge(START, "validar")
+sub.add_conditional_edges("validar", tras_validar)
+sub.add_edge("aprobacion", "confirmar")
+sub.add_edge("confirmar", END)
+
+subgrafo_devoluciones = sub.compile()
 
 # Routes
 def enrutar(estado: Estado) -> Literal["pedidos","devoluciones", "responder"]:
@@ -124,7 +158,7 @@ def enrutar(estado: Estado) -> Literal["pedidos","devoluciones", "responder"]:
 builder = StateGraph(Estado)
 builder.add_node("clasificar", clasificar)
 builder.add_node("pedidos", pedidos)
-builder.add_node("devoluciones", devoluciones)
+builder.add_node("devoluciones", subgrafo_devoluciones) # un grafo compilado como otro nodo
 builder.add_node("responder", responder)
 builder.add_node("tools", ToolNode(herramientas))
 
