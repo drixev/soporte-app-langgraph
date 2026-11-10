@@ -1,6 +1,6 @@
 # Bot de soporte con LangGraph
 
-Proyecto de aprendizaje: un asistente de atención al cliente para una tienda, construido con [LangGraph](https://langchain-ai.github.io/langgraph/).
+Proyecto de práctica: un asistente de atención al cliente para una tienda, construido con [LangGraph](https://langchain-ai.github.io/langgraph/).
 
 ## Qué hace
 
